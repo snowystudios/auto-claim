@@ -12,16 +12,15 @@ from flask_cors import CORS
 import secrets
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 CORS(app)
 
-# Enable debug logging
 DEBUG = True
 
 def log(msg):
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {msg}")
     sys.stdout.flush()
 
@@ -169,7 +168,6 @@ class AuthSession:
         self.auth_ws = DiscordAuthWebsocket(self)
         thread = threading.Thread(target=self.auth_ws.run, daemon=True)
         thread.start()
-        # Wait for fingerprint
         timeout = 10
         while not self.auth_url and timeout > 0:
             time.sleep(0.2)
@@ -179,6 +177,7 @@ class AuthSession:
 @app.route('/api/create_session', methods=['POST'])
 def create_session():
     session_id = secrets.token_urlsafe(16)
+    log(f"Create session {session_id}")
     session = AuthSession(session_id)
     active_sessions[session_id] = session
     url = session.start()
@@ -199,6 +198,7 @@ def check_status(session_id):
         for sid in list(active_sessions.keys()):
             if time.time() - active_sessions[sid].created_at > 300:
                 del active_sessions[sid]
+        log(f"Session {session_id} completed, returning token")
         return jsonify({'status': 'completed', 'user_data': session.user_data})
     return jsonify({'status': 'pending'})
 
@@ -206,6 +206,7 @@ def check_status(session_id):
 def health():
     return jsonify({'status': 'healthy', 'active_sessions': len(active_sessions)})
 
+# For Gunicorn, we don't call app.run()
 if __name__ == '__main__':
     log(f"Starting auth server on port {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=False)
