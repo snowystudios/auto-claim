@@ -17,9 +17,8 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 CORS(app)
 
-# Global storage
-active_sessions = {}      # session_id -> fingerprint or auth_url
-session_results = {}      # session_id -> user_data (when complete)
+active_sessions = {}
+session_results = {}
 
 def log(msg):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -144,19 +143,19 @@ class DiscordAuthWebsocket:
         pub = self.key.publickey().export_key().decode()
         return ''.join(pub.split('\n')[1:-1])
 
-# Flask routes
+# ---------- Flask API ----------
 @app.route('/api/create_session', methods=['POST'])
 def create_session():
     session_id = secrets.token_urlsafe(16)
     log(f"Create session {session_id}")
 
     ws_client = DiscordAuthWebsocket(session_id)
-    thread = threading.Thread(target=ws_client.run, daemon=False)  # NOT daemon, so it stays alive
+    thread = threading.Thread(target=ws_client.run, daemon=False)  # important: not daemon
     thread.start()
 
-    # Wait for fingerprint (max 10 seconds)
+    # Wait for fingerprint (max 10 sec)
     auth_url = None
-    for _ in range(50):  # 10 seconds (0.2s * 50)
+    for _ in range(50):
         if session_id in active_sessions:
             auth_url = active_sessions.pop(session_id)
             break
@@ -184,5 +183,4 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     log(f"Starting auth server on port {port}")
-    # threaded=True allows concurrent requests and keeps background threads alive
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
